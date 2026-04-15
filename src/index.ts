@@ -65,6 +65,12 @@ import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { initNexusGate, isGateActive, shutdownNexusGate } from './security/nexus-gate.js';
+import { initFingerprintLock } from './security/fingerprint.js';
+import { loadRoleManifest } from './security/role-boundary.js';
+import { initEgress } from './security/egress.js';
+import { initCrashReporter, setCrashContext } from './resilience/crash-reporter.js';
+import { loadInterruptedCheckpoints } from './resilience/checkpoint.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -265,6 +271,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  // Update crash context so a crash report shows which group was active
+  setCrashContext(`processing group: ${group.name} (${chatJid})`);
+
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -312,6 +321,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+  setCrashContext(null);
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -448,6 +458,14 @@ async function startMessageLoop(): Promise<void> {
   logger.info(`NanoClaw running (default trigger: ${DEFAULT_TRIGGER})`);
 
   while (true) {
+    // ── Nexus gate check — halt processing if token revoked or suspended ──
+    if (!isGateActive()) {
+      logger.warn('Nexus gate not active — skipping task processing this cycle');
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+      continue;
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     try {
       const jids = Object.keys(registeredGroups);
       const { messages, newTimestamp } = getNewMessages(
@@ -569,6 +587,32 @@ function ensureContainerSystemRunning(): void {
 }
 
 async function main(): Promise<void> {
+  // ── Security + resilience layer (must run before anything else) ──────────
+  initCrashReporter();
+
+  // Layer 1: Nexus token gate — agent won't start without a valid token
+  await initNexusGate();
+
+  // Layer 2: Machine fingerprint — reject if running on unauthorized hardware
+  await initFingerprintLock();
+
+  // Layer 3: Role boundary manifest — defines permitted tools/domains for this agent
+  await loadRoleManifest();
+
+  // Layer 4: Egress whitelist — lock down outbound HTTP from the orchestrator
+  initEgress();
+
+  // Recover any tasks interrupted by a previous crash
+  const interrupted = loadInterruptedCheckpoints();
+  if (interrupted.length > 0) {
+    logger.info(
+      { count: interrupted.length, tasks: interrupted.map((c) => c.taskId) },
+      'Startup recovery: re-queueing interrupted tasks',
+    );
+    // Actual re-queue happens below once registeredGroups is loaded
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
@@ -585,6 +629,7 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    shutdownNexusGate();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);

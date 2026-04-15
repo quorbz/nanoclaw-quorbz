@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  ANTHROPIC_API_KEY,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -18,6 +19,11 @@ import {
   XAI_API_KEY,
   XAI_MODEL,
 } from './config.js';
+import {
+  buildLLMEnvArgs,
+  getLLMAgentVaultKey,
+  resolveLLMConfig,
+} from './llm-provider.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -208,31 +214,44 @@ async function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Pass xAI model selection — the API key is injected below via OneCLI or fallback
-  if (XAI_MODEL) {
-    args.push('-e', `XAI_MODEL=${XAI_MODEL}`);
-  }
+  // Resolve LLM provider (xAI or Anthropic) and inject model env vars
+  const llmConfig = resolveLLMConfig();
+  args.push(...buildLLMEnvArgs(llmConfig));
 
-  // OneCLI gateway handles XAI_API_KEY injection — containers never see raw secrets.
+  // Determine the OneCLI vault key for this agent + provider combo
+  const vaultAgent = agentIdentifier
+    ? getLLMAgentVaultKey(agentIdentifier, llmConfig)
+    : undefined;
+
+  // OneCLI gateway handles API key injection — containers never see raw secrets.
   // The gateway intercepts outbound traffic and injects credentials at request time.
   const onecliApplied = await onecli.applyContainerConfig(args, {
     addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
+    agent: vaultAgent ?? agentIdentifier,
   });
   if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
+    logger.info({ containerName, provider: llmConfig.provider }, 'OneCLI gateway config applied');
   } else {
     logger.warn(
-      { containerName },
-      'OneCLI gateway not reachable — falling back to direct XAI_API_KEY injection',
+      { containerName, provider: llmConfig.provider },
+      'OneCLI gateway not reachable — falling back to direct API key injection',
     );
-    // Fallback: inject XAI_API_KEY directly when OneCLI is not available.
-    // This covers remote agent machines that don't run a local OneCLI instance.
-    if (XAI_API_KEY) {
-      args.push('-e', `XAI_API_KEY=${XAI_API_KEY}`);
-      logger.info({ containerName }, 'XAI_API_KEY injected directly from host env');
+    // Fallback: inject API key directly when OneCLI is unavailable.
+    // Covers remote agent machines without a local OneCLI instance.
+    if (llmConfig.provider === 'anthropic') {
+      if (ANTHROPIC_API_KEY) {
+        args.push('-e', `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`);
+        logger.info({ containerName }, 'ANTHROPIC_API_KEY injected directly from host env');
+      } else {
+        logger.error({ containerName }, 'No ANTHROPIC_API_KEY available — agent will fail to authenticate');
+      }
     } else {
-      logger.error({ containerName }, 'No XAI_API_KEY available — agent will fail to authenticate');
+      if (XAI_API_KEY) {
+        args.push('-e', `XAI_API_KEY=${XAI_API_KEY}`);
+        logger.info({ containerName }, 'XAI_API_KEY injected directly from host env');
+      } else {
+        logger.error({ containerName }, 'No XAI_API_KEY available — agent will fail to authenticate');
+      }
     }
   }
 
