@@ -10,6 +10,8 @@ const envConfig = readEnvFile([
   'ASSISTANT_HAS_OWN_NUMBER',
   'ONECLI_URL',
   'TZ',
+  'XAI_API_KEY',
+  'XAI_MODEL',
 ]);
 
 export const ASSISTANT_NAME =
@@ -41,8 +43,13 @@ export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
+// xAI / Grok configuration
+export const XAI_API_KEY = process.env.XAI_API_KEY || envConfig.XAI_API_KEY;
+export const XAI_MODEL =
+  process.env.XAI_MODEL || envConfig.XAI_MODEL || 'grok-4-1-fast-reasoning';
+
 export const CONTAINER_IMAGE =
-  process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+  process.env.CONTAINER_IMAGE || 'nanoclaw-xai-agent:latest';
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,

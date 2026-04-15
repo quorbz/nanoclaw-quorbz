@@ -9,14 +9,22 @@ store/
 data/
 logs/
 
-# Groups - only track base structure and specific CLAUDE.md files
+# Groups - only track base structure, template, and specific CLAUDE.md files
 groups/*
 !groups/main/
 !groups/global/
+!groups/template/
 groups/main/*
 groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
+# Template group files are tracked — they are the deployment blueprint
+!groups/template/CLAUDE.md
+!groups/template/LEARNINGS.md
+!groups/template/ERRORS.md
+!groups/template/CURRENT_TASK.md
+!groups/template/session-summary.md
+!groups/template/self-reflection-loop.md
 
 # Secrets
 *.keys.json

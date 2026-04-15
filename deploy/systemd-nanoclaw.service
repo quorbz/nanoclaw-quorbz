@@ -1,0 +1,22 @@
+# NanoClaw-Quorbz systemd user service (Linux agents — DL360, DL380)
+# Install to: ~/.config/systemd/user/nanoclaw.service
+# Enable: systemctl --user enable nanoclaw && systemctl --user start nanoclaw
+# Logs: journalctl --user -u nanoclaw -f
+
+[Unit]
+Description=NanoClaw-Quorbz Agent (%i)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nanoclaw
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=5
+EnvironmentFile=%h/nanoclaw/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -15,6 +15,8 @@ import {
   IDLE_TIMEOUT,
   ONECLI_URL,
   TIMEZONE,
+  XAI_API_KEY,
+  XAI_MODEL,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -134,55 +136,9 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  // Per-group agent state directory (isolated — prevents cross-group access)
+  const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder);
   fs.mkdirSync(groupSessionsDir, { recursive: true });
-  const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-  }
-
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
-  const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
-    }
-  }
-  mounts.push({
-    hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
-    readonly: false,
-  });
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -252,8 +208,13 @@ async function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
+  // Pass xAI model selection — the API key is injected below via OneCLI or fallback
+  if (XAI_MODEL) {
+    args.push('-e', `XAI_MODEL=${XAI_MODEL}`);
+  }
+
+  // OneCLI gateway handles XAI_API_KEY injection — containers never see raw secrets.
+  // The gateway intercepts outbound traffic and injects credentials at request time.
   const onecliApplied = await onecli.applyContainerConfig(args, {
     addHostMapping: false, // Nanoclaw already handles host gateway
     agent: agentIdentifier,
@@ -263,8 +224,16 @@ async function buildContainerArgs(
   } else {
     logger.warn(
       { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
+      'OneCLI gateway not reachable — falling back to direct XAI_API_KEY injection',
     );
+    // Fallback: inject XAI_API_KEY directly when OneCLI is not available.
+    // This covers remote agent machines that don't run a local OneCLI instance.
+    if (XAI_API_KEY) {
+      args.push('-e', `XAI_API_KEY=${XAI_API_KEY}`);
+      logger.info({ containerName }, 'XAI_API_KEY injected directly from host env');
+    } else {
+      logger.error({ containerName }, 'No XAI_API_KEY available — agent will fail to authenticate');
+    }
   }
 
   // Runtime-specific args for host gateway resolution

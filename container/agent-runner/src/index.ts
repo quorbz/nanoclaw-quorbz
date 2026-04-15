@@ -1,28 +1,48 @@
 /**
- * NanoClaw Agent Runner
- * Runs inside a container, receives config via stdin, outputs result to stdout
+ * NanoClaw-Quorbz Agent Runner
+ * Runs inside a container, receives config via stdin, outputs result to stdout.
+ * Uses xAI (Grok) via the OpenAI-compatible API — no Anthropic dependencies.
  *
  * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
+ *   Stdin: Full ContainerInput JSON (read until EOF)
  *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
  *          Files: {type:"message", text:"..."}.json — polled and consumed
  *          Sentinel: /workspace/ipc/input/_close — signals session end
  *
  * Stdout protocol:
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
- *   Final marker after loop ends signals completion.
+ *   Multiple results may be emitted. Final marker after loop ends signals completion.
+ *
+ * Credentials: XAI_API_KEY injected by OneCLI at runtime — never hardcoded.
  */
 
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
-import {
-  query,
-  HookCallback,
-  PreCompactHookInput,
-} from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { glob } from 'glob';
+import OpenAI from 'openai';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const XAI_BASE_URL = 'https://api.x.ai/v1';
+const DEFAULT_MODEL = 'grok-4-1-fast-reasoning';
+const MODEL = process.env.XAI_MODEL ?? DEFAULT_MODEL;
+const MAX_TOKENS = parseInt(process.env.XAI_MAX_TOKENS ?? '8192', 10);
+const IPC_INPUT_DIR = '/workspace/ipc/input';
+const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
+const IPC_POLL_MS = 500;
+const SCRIPT_TIMEOUT_MS = 30_000;
+const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
+const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 interface ContainerInput {
   prompt: string;
@@ -42,80 +62,20 @@ interface ContainerOutput {
   error?: string;
 }
 
-interface SessionEntry {
-  sessionId: string;
-  fullPath: string;
-  summary: string;
-  firstPrompt: string;
+interface ScriptResult {
+  wakeAgent: boolean;
+  data?: unknown;
 }
 
-interface SessionsIndex {
-  entries: SessionEntry[];
+type Message = OpenAI.Chat.ChatCompletionMessageParam;
+
+// ---------------------------------------------------------------------------
+// Logging and output helpers
+// ---------------------------------------------------------------------------
+
+function log(msg: string): void {
+  console.error(`[nanoclaw-quorbz] ${msg}`);
 }
-
-interface SDKUserMessage {
-  type: 'user';
-  message: { role: 'user'; content: string };
-  parent_tool_use_id: null;
-  session_id: string;
-}
-
-const IPC_INPUT_DIR = '/workspace/ipc/input';
-const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 500;
-
-/**
- * Push-based async iterable for streaming user messages to the SDK.
- * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
- */
-class MessageStream {
-  private queue: SDKUserMessage[] = [];
-  private waiting: (() => void) | null = null;
-  private done = false;
-
-  push(text: string): void {
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-  }
-
-  end(): void {
-    this.done = true;
-    this.waiting?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      }
-      if (this.done) return;
-      await new Promise<void>((r) => {
-        this.waiting = r;
-      });
-      this.waiting = null;
-    }
-  }
-}
-
-async function readStdin(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk) => {
-      data += chunk;
-    });
-    process.stdin.on('end', () => resolve(data));
-    process.stdin.on('error', reject);
-  });
-}
-
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
@@ -123,613 +83,608 @@ function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_END_MARKER);
 }
 
-function log(message: string): void {
-  console.error(`[agent-runner] ${message}`);
+async function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => (data += chunk));
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', reject);
+  });
 }
 
-function getSessionSummary(
-  sessionId: string,
-  transcriptPath: string,
-): string | null {
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, 'sessions-index.json');
+// ---------------------------------------------------------------------------
+// IPC helpers
+// ---------------------------------------------------------------------------
 
-  if (!fs.existsSync(indexPath)) {
-    log(`Sessions index not found at ${indexPath}`);
-    return null;
-  }
-
-  try {
-    const index: SessionsIndex = JSON.parse(
-      fs.readFileSync(indexPath, 'utf-8'),
-    );
-    const entry = index.entries.find((e) => e.sessionId === sessionId);
-    if (entry?.summary) {
-      return entry.summary;
-    }
-  } catch (err) {
-    log(
-      `Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
-  return null;
-}
-
-/**
- * Archive the full transcript to conversations/ before compaction.
- */
-function createPreCompactHook(assistantName?: string): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preCompact = input as PreCompactHookInput;
-    const transcriptPath = preCompact.transcript_path;
-    const sessionId = preCompact.session_id;
-
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log('No transcript found for archiving');
-      return {};
-    }
-
-    try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
-
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
-      }
-
-      const summary = getSessionSummary(sessionId, transcriptPath);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(
-        messages,
-        summary,
-        assistantName,
-      );
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
-    } catch (err) {
-      log(
-        `Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-
-    return {};
-  };
-}
-
-function sanitizeFilename(summary: string): string {
-  return summary
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 50);
-}
-
-function generateFallbackName(): string {
-  const time = new Date();
-  return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
-}
-
-interface ParsedMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text =
-          typeof entry.message.content === 'string'
-            ? entry.message.content
-            : entry.message.content
-                .map((c: { text?: string }) => c.text || '')
-                .join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {}
-  }
-
-  return messages;
-}
-
-function formatTranscriptMarkdown(
-  messages: ParsedMessage[],
-  title?: string | null,
-  assistantName?: string,
-): string {
-  const now = new Date();
-  const formatDateTime = (d: Date) =>
-    d.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    });
-
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : assistantName || 'Assistant';
-    const content =
-      msg.content.length > 2000
-        ? msg.content.slice(0, 2000) + '...'
-        : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
-/**
- * Check for _close sentinel.
- */
 function shouldClose(): boolean {
   if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try {
-      fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
-    } catch {
-      /* ignore */
-    }
+    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
     return true;
   }
   return false;
 }
 
-/**
- * Drain all pending IPC input messages.
- * Returns messages found, or empty array.
- */
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs
-      .readdirSync(IPC_INPUT_DIR)
+    const files = fs.readdirSync(IPC_INPUT_DIR)
       .filter((f) => f.endsWith('.json'))
       .sort();
-
     const messages: string[] = [];
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          messages.push(data.text);
-        }
-      } catch (err) {
-        log(
-          `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        try {
-          fs.unlinkSync(filePath);
-        } catch {
-          /* ignore */
-        }
-      }
+        if (data.type === 'message' && data.text) messages.push(data.text);
+      } catch { try { fs.unlinkSync(filePath); } catch { /* ignore */ } }
     }
     return messages;
-  } catch (err) {
-    log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
+  } catch {
     return [];
   }
 }
 
-/**
- * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
- */
 function waitForIpcMessage(): Promise<string | null> {
   return new Promise((resolve) => {
     const poll = () => {
-      if (shouldClose()) {
-        resolve(null);
-        return;
-      }
-      const messages = drainIpcInput();
-      if (messages.length > 0) {
-        resolve(messages.join('\n'));
-        return;
-      }
+      if (shouldClose()) { resolve(null); return; }
+      const msgs = drainIpcInput();
+      if (msgs.length > 0) { resolve(msgs.join('\n')); return; }
       setTimeout(poll, IPC_POLL_MS);
     };
     poll();
   });
 }
 
-/**
- * Run a single query and stream results via writeOutput.
- * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
- * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
- */
-async function runQuery(
-  prompt: string,
-  sessionId: string | undefined,
-  mcpServerPath: string,
-  containerInput: ContainerInput,
-  sdkEnv: Record<string, string | undefined>,
-  resumeAt?: string,
-): Promise<{
-  newSessionId?: string;
-  lastAssistantUuid?: string;
-  closedDuringQuery: boolean;
-}> {
-  const stream = new MessageStream();
-  stream.push(prompt);
+// ---------------------------------------------------------------------------
+// Built-in tool implementations
+// ---------------------------------------------------------------------------
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
-  let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+async function toolBash(command: string, timeout?: number): Promise<string> {
+  return new Promise((resolve) => {
+    execFile('bash', ['-c', command], {
+      timeout: timeout ?? 60_000,
+      maxBuffer: 10 * 1024 * 1024,
+      env: process.env,
+    }, (err, stdout, stderr) => {
+      const out = [stdout, stderr].filter(Boolean).join('\n').trim();
+      if (err && !out) resolve(`Error (exit ${(err as NodeJS.ErrnoException & { code?: number }).code ?? 1}): ${err.message}`);
+      else resolve(out || '(no output)');
+    });
+  });
+}
 
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
-
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+async function toolReadFile(filePath: string, offset?: number, limit?: number): Promise<string> {
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n');
+    const start = Math.max(0, (offset ?? 1) - 1);
+    const end = limit ? start + limit : lines.length;
+    return lines.slice(start, end).map((l, i) => `${start + i + 1}\t${l}`).join('\n');
+  } catch (err) {
+    return `Error reading file: ${(err as Error).message}`;
   }
+}
 
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
-  const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
-      }
-    }
+async function toolWriteFile(filePath: string, content: string): Promise<string> {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content, 'utf-8');
+    return `Written: ${filePath}`;
+  } catch (err) {
+    return `Error writing file: ${(err as Error).message}`;
   }
-  if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
-  }
+}
 
-  for await (const message of query({
-    prompt: stream,
-    options: {
-      cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? {
-            type: 'preset' as const,
-            preset: 'claude_code' as const,
-            append: globalClaudeMd,
-          }
-        : undefined,
-      allowedTools: [
-        'Bash',
-        'Read',
-        'Write',
-        'Edit',
-        'Glob',
-        'Grep',
-        'WebSearch',
-        'WebFetch',
-        'Task',
-        'TaskOutput',
-        'TaskStop',
-        'TeamCreate',
-        'TeamDelete',
-        'SendMessage',
-        'TodoWrite',
-        'ToolSearch',
-        'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*',
-      ],
-      env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
+async function toolEditFile(filePath: string, oldStr: string, newStr: string, replaceAll?: boolean): Promise<string> {
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    if (!content.includes(oldStr)) return `Error: old_string not found in ${filePath}`;
+    const updated = replaceAll ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
+    fs.writeFileSync(filePath, updated, 'utf-8');
+    return `Edited: ${filePath}`;
+  } catch (err) {
+    return `Error editing file: ${(err as Error).message}`;
+  }
+}
+
+async function toolGlob(pattern: string, cwd?: string): Promise<string> {
+  try {
+    const matches = await glob(pattern, { cwd: cwd ?? process.cwd(), dot: true });
+    return matches.length === 0 ? '(no matches)' : matches.sort().join('\n');
+  } catch (err) {
+    return `Error: ${(err as Error).message}`;
+  }
+}
+
+async function toolGrep(
+  pattern: string,
+  searchPath?: string,
+  globPattern?: string,
+  outputMode?: string,
+  contextLines?: number,
+): Promise<string> {
+  const args = ['-r', '--color=never'];
+  if (outputMode === 'files_with_matches') args.push('-l');
+  else if (outputMode === 'count') args.push('-c');
+  else { args.push('-n'); if (contextLines) args.push(`-C${contextLines}`); }
+  if (globPattern) args.push(`--include=${globPattern}`);
+  args.push(pattern, searchPath ?? '.');
+  return new Promise((resolve) => {
+    execFile('grep', args, { maxBuffer: 5 * 1024 * 1024, cwd: process.cwd() }, (err, stdout) => {
+      if (err && (err as NodeJS.ErrnoException & { code?: number }).code === 2) resolve(`Error: ${err.message}`);
+      else resolve(stdout.trim() || '(no matches)');
+    });
+  });
+}
+
+async function toolWebFetch(url: string): Promise<string> {
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'NanoClaw-Quorbz/1.0' },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await response.text();
+    return text.length > 50000 ? text.slice(0, 50000) + '\n...[truncated]' : text;
+  } catch (err) {
+    return `Error fetching URL: ${(err as Error).message}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in tool definitions (OpenAI function-calling format)
+// ---------------------------------------------------------------------------
+
+const BUILTIN_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'Bash',
+      description: 'Execute a bash command in the container sandbox and return output. Use for system commands, scripts, git, npm, sqlite3, file operations, etc.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The bash command to execute' },
+          timeout: { type: 'number', description: 'Timeout in milliseconds (default: 60000)' },
         },
-      },
-      hooks: {
-        PreCompact: [
-          { hooks: [createPreCompactHook(containerInput.assistantName)] },
-        ],
+        required: ['command'],
       },
     },
-  })) {
-    messageCount++;
-    const msgType =
-      message.type === 'system'
-        ? `system/${(message as { subtype?: string }).subtype}`
-        : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'Read',
+      description: 'Read a file from the filesystem with line numbers.',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string', description: 'Absolute path to the file' },
+          offset: { type: 'number', description: 'Line number to start from (1-indexed)' },
+          limit: { type: 'number', description: 'Number of lines to read' },
+        },
+        required: ['file_path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'Write',
+      description: 'Write content to a file. Creates parent directories if needed.',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string', description: 'Absolute path to the file' },
+          content: { type: 'string', description: 'Content to write' },
+        },
+        required: ['file_path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'Edit',
+      description: 'Edit a file by replacing a specific string with another.',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string', description: 'Absolute path to the file' },
+          old_string: { type: 'string', description: 'Exact string to find and replace' },
+          new_string: { type: 'string', description: 'String to replace it with' },
+          replace_all: { type: 'boolean', description: 'Replace all occurrences (default: false)' },
+        },
+        required: ['file_path', 'old_string', 'new_string'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'Glob',
+      description: 'Find files matching a glob pattern.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Glob pattern (e.g. "**/*.ts")' },
+          path: { type: 'string', description: 'Directory to search in (default: cwd)' },
+        },
+        required: ['pattern'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'Grep',
+      description: 'Search file contents using grep.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Regex pattern to search for' },
+          path: { type: 'string', description: 'File or directory to search' },
+          glob: { type: 'string', description: 'File glob filter (e.g. "*.ts")' },
+          output_mode: {
+            type: 'string',
+            enum: ['content', 'files_with_matches', 'count'],
+            description: 'Output mode (default: content)',
+          },
+          context: { type: 'number', description: 'Lines of context around matches' },
+        },
+        required: ['pattern'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'WebFetch',
+      description: 'Fetch content from a URL (HTML, JSON, text). Returns up to 50k characters.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'URL to fetch' },
+        },
+        required: ['url'],
+      },
+    },
+  },
+];
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
+// ---------------------------------------------------------------------------
+// MCP client — NanoClaw IPC tools (send_message, schedule_task, etc.)
+// ---------------------------------------------------------------------------
+
+async function createMcpClient(mcpServerPath: string, containerInput: ContainerInput): Promise<Client | null> {
+  try {
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        ...process.env,
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      } as Record<string, string>,
+    });
+    const client = new Client({ name: 'nanoclaw-quorbz', version: '1.0.0' });
+    await client.connect(transport);
+    log('MCP client connected');
+    return client;
+  } catch (err) {
+    log(`MCP client failed: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+async function getMcpTools(client: Client): Promise<OpenAI.Chat.ChatCompletionTool[]> {
+  try {
+    const result = await client.listTools();
+    return result.tools.map((t) => ({
+      type: 'function' as const,
+      function: {
+        name: `mcp__nanoclaw__${t.name}`,
+        description: (t as { description?: string }).description ?? `MCP tool: ${t.name}`,
+        parameters: ((t as { inputSchema?: Record<string, unknown> }).inputSchema ?? { type: 'object', properties: {} }) as Record<string, unknown>,
+      },
+    }));
+  } catch (err) {
+    log(`Failed to list MCP tools: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+async function callMcpTool(client: Client, toolName: string, args: Record<string, unknown>): Promise<string> {
+  try {
+    const result = await client.callTool({ name: toolName, arguments: args });
+    const content = result.content;
+    if (Array.isArray(content)) {
+      return content.map((c: { type?: string; text?: string }) => c.type === 'text' ? c.text : JSON.stringify(c)).join('\n');
     }
+    return JSON.stringify(result);
+  } catch (err) {
+    return `MCP tool error: ${(err as Error).message}`;
+  }
+}
 
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-    }
+// ---------------------------------------------------------------------------
+// Tool dispatch
+// ---------------------------------------------------------------------------
 
-    if (
-      message.type === 'system' &&
-      (message as { subtype?: string }).subtype === 'task_notification'
-    ) {
-      const tn = message as {
-        task_id: string;
-        status: string;
-        summary: string;
-      };
-      log(
-        `Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`,
-      );
-    }
+async function dispatchTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  mcpClient: Client | null,
+): Promise<string> {
+  switch (toolName) {
+    case 'Bash':      return toolBash(args.command as string, args.timeout as number | undefined);
+    case 'Read':      return toolReadFile(args.file_path as string, args.offset as number | undefined, args.limit as number | undefined);
+    case 'Write':     return toolWriteFile(args.file_path as string, args.content as string);
+    case 'Edit':      return toolEditFile(args.file_path as string, args.old_string as string, args.new_string as string, args.replace_all as boolean | undefined);
+    case 'Glob':      return toolGlob(args.pattern as string, args.path as string | undefined);
+    case 'Grep':      return toolGrep(args.pattern as string, args.path as string | undefined, args.glob as string | undefined, args.output_mode as string | undefined, args.context as number | undefined);
+    case 'WebFetch':  return toolWebFetch(args.url as string);
+    default:
+      if (toolName.startsWith('mcp__nanoclaw__') && mcpClient) {
+        return callMcpTool(mcpClient, toolName.replace('mcp__nanoclaw__', ''), args);
+      }
+      return `Unknown tool: ${toolName}`;
+  }
+}
 
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult =
-        'result' in message ? (message as { result?: string }).result : null;
-      log(
-        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
-      );
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId,
+// ---------------------------------------------------------------------------
+// Agent loop — calls xAI, executes tools, iterates until done
+// ---------------------------------------------------------------------------
+
+async function runAgentLoop(
+  prompt: string,
+  systemPrompt: string,
+  xaiClient: OpenAI,
+  tools: OpenAI.Chat.ChatCompletionTool[],
+  mcpClient: Client | null,
+): Promise<string> {
+  const messages: Message[] = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: prompt },
+  ];
+
+  const MAX_ITER = 50;
+
+  for (let iter = 0; iter < MAX_ITER; iter++) {
+    log(`Agent loop iteration ${iter + 1}`);
+
+    let response: OpenAI.Chat.ChatCompletion;
+    try {
+      response = await xaiClient.chat.completions.create({
+        model: MODEL,
+        messages,
+        tools: tools.length > 0 ? tools : undefined,
+        tool_choice: tools.length > 0 ? 'auto' : undefined,
+        max_tokens: MAX_TOKENS,
       });
+    } catch (err) {
+      const msg = `xAI API error: ${(err as Error).message}`;
+      log(msg);
+      return msg;
+    }
+
+    const choice = response.choices[0];
+    if (!choice) return 'No response from model';
+
+    const assistantMsg = choice.message;
+    messages.push(assistantMsg as Message);
+
+    // No tool calls — final answer
+    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+      return assistantMsg.content ?? '';
+    }
+
+    // Execute tool calls sequentially
+    for (const toolCall of assistantMsg.tool_calls) {
+      const toolName = toolCall.function.name;
+      let toolArgs: Record<string, unknown> = {};
+      try { toolArgs = JSON.parse(toolCall.function.arguments) as Record<string, unknown>; } catch { /* empty */ }
+
+      log(`Tool: ${toolName}`);
+      const result = await dispatchTool(toolName, toolArgs, mcpClient);
+      log(`Tool ${toolName}: ${result.length} chars`);
+
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: result,
+      } as Message);
+    }
+
+    if (shouldClose()) {
+      log('Close sentinel during agent loop');
+      return assistantMsg.content ?? '(interrupted)';
     }
   }
 
-  ipcPolling = false;
-  log(
-    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`,
-  );
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  return `(agent loop reached max iterations: ${MAX_ITER})`;
 }
 
-interface ScriptResult {
-  wakeAgent: boolean;
-  data?: unknown;
-}
-
-const SCRIPT_TIMEOUT_MS = 30_000;
+// ---------------------------------------------------------------------------
+// Script execution (scheduled task pre-check)
+// ---------------------------------------------------------------------------
 
 async function runScript(script: string): Promise<ScriptResult | null> {
   const scriptPath = '/tmp/task-script.sh';
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
-
   return new Promise((resolve) => {
-    execFile(
-      'bash',
-      [scriptPath],
-      {
-        timeout: SCRIPT_TIMEOUT_MS,
-        maxBuffer: 1024 * 1024,
-        env: process.env,
-      },
-      (error, stdout, stderr) => {
-        if (stderr) {
-          log(`Script stderr: ${stderr.slice(0, 500)}`);
-        }
-
-        if (error) {
-          log(`Script error: ${error.message}`);
-          return resolve(null);
-        }
-
-        // Parse last non-empty line of stdout as JSON
-        const lines = stdout.trim().split('\n');
-        const lastLine = lines[lines.length - 1];
-        if (!lastLine) {
-          log('Script produced no output');
-          return resolve(null);
-        }
-
-        try {
-          const result = JSON.parse(lastLine);
-          if (typeof result.wakeAgent !== 'boolean') {
-            log(
-              `Script output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`,
-            );
-            return resolve(null);
-          }
-          resolve(result as ScriptResult);
-        } catch {
-          log(`Script output is not valid JSON: ${lastLine.slice(0, 200)}`);
-          resolve(null);
-        }
-      },
-    );
+    execFile('bash', [scriptPath], {
+      timeout: SCRIPT_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      env: process.env,
+    }, (error, stdout, stderr) => {
+      if (stderr) log(`Script stderr: ${stderr.slice(0, 500)}`);
+      if (error) { log(`Script error: ${error.message}`); return resolve(null); }
+      const lines = stdout.trim().split('\n');
+      const lastLine = lines[lines.length - 1];
+      if (!lastLine) { log('Script: no output'); return resolve(null); }
+      try {
+        const result = JSON.parse(lastLine);
+        if (typeof result.wakeAgent !== 'boolean') { log('Script: missing wakeAgent'); return resolve(null); }
+        resolve(result as ScriptResult);
+      } catch { log(`Script: invalid JSON output`); resolve(null); }
+    });
   });
 }
+
+// ---------------------------------------------------------------------------
+// System prompt construction — reads CLAUDE.md files from workspace
+// ---------------------------------------------------------------------------
+
+function buildSystemPrompt(containerInput: ContainerInput): string {
+  const lines: string[] = [];
+
+  // Agent identity and memory — from group CLAUDE.md
+  const groupClaudeMd = '/workspace/group/CLAUDE.md';
+  if (fs.existsSync(groupClaudeMd)) {
+    lines.push(fs.readFileSync(groupClaudeMd, 'utf-8'));
+    lines.push('');
+  }
+
+  // Shared Quorbz context — from global CLAUDE.md (skip for main channel)
+  if (!containerInput.isMain) {
+    const globalClaudeMd = '/workspace/global/CLAUDE.md';
+    if (fs.existsSync(globalClaudeMd)) {
+      lines.push('--- Quorbz Global Context ---');
+      lines.push(fs.readFileSync(globalClaudeMd, 'utf-8'));
+      lines.push('');
+    }
+  }
+
+  lines.push(`Model: ${MODEL}`);
+  lines.push(`Working directory: /workspace/group`);
+  lines.push(`Group folder: ${containerInput.groupFolder}`);
+  if (containerInput.assistantName) lines.push(`Name: ${containerInput.assistantName}`);
+
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Startup health check — verifies memory files exist before processing
+// ---------------------------------------------------------------------------
+
+function runHealthCheck(groupFolder: string): string[] {
+  const warnings: string[] = [];
+  const memoryFiles = ['CLAUDE.md', 'LEARNINGS.md', 'ERRORS.md', 'CURRENT_TASK.md', 'session-summary.md', 'self-reflection-loop.md'];
+  for (const file of memoryFiles) {
+    const filePath = path.join('/workspace/group', file);
+    if (!fs.existsSync(filePath)) {
+      warnings.push(`Missing memory file: ${file}`);
+    }
+  }
+  if (warnings.length > 0) {
+    log(`Health check warnings for ${groupFolder}: ${warnings.join(', ')}`);
+  }
+  return warnings;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
   try {
     const stdinData = await readStdin();
-    containerInput = JSON.parse(stdinData);
-    try {
-      fs.unlinkSync('/tmp/input.json');
-    } catch {
-      /* may not exist */
-    }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    containerInput = JSON.parse(stdinData) as ContainerInput;
+    log(`Input received for group: ${containerInput.groupFolder}`);
   } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    writeOutput({ status: 'error', result: null, error: `Failed to parse input: ${(err as Error).message}` });
     process.exit(1);
   }
 
-  // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
-  // No real secrets exist in the container environment.
-  const sdkEnv: Record<string, string | undefined> = {
-    ...process.env,
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW: '165000',
-  };
+  // Validate API key
+  const apiKey = process.env.XAI_API_KEY;
+  if (!apiKey) {
+    writeOutput({ status: 'error', result: null, error: 'XAI_API_KEY not set — check OneCLI vault configuration' });
+    process.exit(1);
+  }
+
+  // Startup health check
+  const healthWarnings = runHealthCheck(containerInput.groupFolder);
+  if (healthWarnings.length > 0) {
+    log(`HEALTH WARNING: ${healthWarnings.join('; ')}`);
+    // Continue running — health warnings are non-fatal, but will be reported via agent response
+  }
+
+  const xaiClient = new OpenAI({ apiKey, baseURL: XAI_BASE_URL });
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
-  let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
-  // Clean up stale _close sentinel from previous container runs
-  try {
-    fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
-  } catch {
-    /* ignore */
-  }
+  const mcpClient = await createMcpClient(mcpServerPath, containerInput);
+  const mcpTools = mcpClient ? await getMcpTools(mcpClient) : [];
+  const allTools = [...BUILTIN_TOOLS, ...mcpTools];
+  log(`Tools: ${allTools.map((t) => t.function.name).join(', ')}`);
 
-  // Build initial prompt (drain any pending IPC messages too)
+  // Build initial prompt
   let prompt = containerInput.prompt;
   if (containerInput.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
+    prompt = `[SCHEDULED TASK — automated, not from a user]\n\n${prompt}`;
   }
   const pending = drainIpcInput();
-  if (pending.length > 0) {
-    log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
-  }
+  if (pending.length > 0) prompt += '\n' + pending.join('\n');
 
-  // Script phase: run script before waking agent
+  // Script phase (scheduled tasks only)
   if (containerInput.script && containerInput.isScheduledTask) {
     log('Running task script...');
     const scriptResult = await runScript(containerInput.script);
-
     if (!scriptResult || !scriptResult.wakeAgent) {
-      const reason = scriptResult
-        ? 'wakeAgent=false'
-        : 'script error/no output';
-      log(`Script decided not to wake agent: ${reason}`);
-      writeOutput({
-        status: 'success',
-        result: null,
-      });
+      log(`Script skip: ${scriptResult ? 'wakeAgent=false' : 'error'}`);
+      writeOutput({ status: 'success', result: null });
       return;
     }
-
-    // Script says wake agent — enrich prompt with script data
-    log(`Script wakeAgent=true, enriching prompt with data`);
     prompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${containerInput.prompt}`;
   }
 
-  // Query loop: run query → wait for IPC message → run new query → repeat
-  let resumeAt: string | undefined;
+  // Health warning injection — if files are missing, tell the agent to report it
+  if (healthWarnings.length > 0) {
+    prompt = `[SYSTEM HEALTH WARNING — report to Benjamin via Telegram before doing anything else]\nMissing memory files: ${healthWarnings.join(', ')}\n\n${prompt}`;
+  }
+
+  const systemPrompt = buildSystemPrompt(containerInput);
+  const sessionId = `xai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Main query-and-wait loop
+  let currentPrompt = prompt;
   try {
     while (true) {
-      log(
-        `Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`,
-      );
+      log(`Running agent loop (session: ${sessionId})...`);
+      const result = await runAgentLoop(currentPrompt, systemPrompt, xaiClient, allTools, mcpClient);
+      log(`Loop complete: ${result.length} chars`);
 
-      const queryResult = await runQuery(
-        prompt,
-        sessionId,
-        mcpServerPath,
-        containerInput,
-        sdkEnv,
-        resumeAt,
-      );
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
-      }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
-      }
-
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
-
-      // Emit session update so host can track it
+      writeOutput({ status: 'success', result, newSessionId: sessionId });
       writeOutput({ status: 'success', result: null, newSessionId: sessionId });
 
-      log('Query ended, waiting for next IPC message...');
-
-      // Wait for the next message or _close sentinel
+      log('Waiting for next IPC message...');
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
-        log('Close sentinel received, exiting');
+        log('Close sentinel — exiting');
         break;
       }
 
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
+      log(`Follow-up message received (${nextMessage.length} chars)`);
+      currentPrompt = nextMessage;
     }
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errorMessage = (err as Error).message;
     log(`Agent error: ${errorMessage}`);
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId: sessionId,
-      error: errorMessage,
-    });
+    writeOutput({ status: 'error', result: null, newSessionId: sessionId, error: errorMessage });
     process.exit(1);
+  } finally {
+    if (mcpClient) { try { await mcpClient.close(); } catch { /* ignore */ } }
   }
 }
 

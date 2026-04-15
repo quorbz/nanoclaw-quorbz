@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- NanoClaw-Quorbz launchd plist (macOS agents — Mac Studio, Mac Mini)
+     Install to: ~/Library/LaunchAgents/com.nanoclaw.plist
+     Load: launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
+     Replace {{NODE_PATH}}, {{PROJECT_ROOT}}, {{HOME}}, {{ASSISTANT_NAME}}
+     before installing. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -22,7 +27,7 @@
         <key>HOME</key>
         <string>{{HOME}}</string>
         <key>ASSISTANT_NAME</key>
-        <string>Andy</string>
+        <string>{{ASSISTANT_NAME}}</string>
     </dict>
     <key>StandardOutPath</key>
     <string>{{PROJECT_ROOT}}/logs/nanoclaw.log</string>
