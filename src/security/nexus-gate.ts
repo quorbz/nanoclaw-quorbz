@@ -21,7 +21,7 @@ export type GateState = 'active' | 'suspended' | 'revoked';
 
 interface TokenResponse {
   token: string;
-  expiresAt: number;   // Unix ms
+  expiresAt: number; // Unix ms
   state: GateState;
 }
 
@@ -32,11 +32,11 @@ interface CheckResponse {
 }
 
 // Grace period: retry Nexus connection for this many ms before suspending
-const NEXUS_UNREACHABLE_GRACE_MS = 10 * 60 * 1000;  // 10 minutes
+const NEXUS_UNREACHABLE_GRACE_MS = 10 * 60 * 1000; // 10 minutes
 // How often to refresh the token (must be < token TTL on Nexus)
-const TOKEN_REFRESH_INTERVAL_MS = 12 * 60 * 1000;   // 12 minutes
+const TOKEN_REFRESH_INTERVAL_MS = 12 * 60 * 1000; // 12 minutes
 // Token validity window — if expiry is within this, refresh now
-const TOKEN_REFRESH_EARLY_MS = 3 * 60 * 1000;        // 3 minutes
+const TOKEN_REFRESH_EARLY_MS = 3 * 60 * 1000; // 3 minutes
 
 let currentToken: string | null = null;
 let tokenExpiresAt: number = 0;
@@ -46,10 +46,8 @@ let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
 function getNexusConfig(): { url: string; agentId: string } {
   const env = readEnvFile(['NEXUS_URL', 'NEXUS_AGENT_ID']);
-  const url =
-    process.env.NEXUS_URL || env.NEXUS_URL || 'http://localhost:4000';
-  const agentId =
-    process.env.NEXUS_AGENT_ID || env.NEXUS_AGENT_ID || 'unknown';
+  const url = process.env.NEXUS_URL || env.NEXUS_URL || 'http://localhost:4000';
+  const agentId = process.env.NEXUS_AGENT_ID || env.NEXUS_AGENT_ID || 'unknown';
   return { url, agentId };
 }
 
@@ -74,20 +72,20 @@ async function fetchWithTimeout(
 async function requestToken(): Promise<TokenResponse | null> {
   const { url, agentId } = getNexusConfig();
   try {
-    const res = await fetchWithTimeout(
-      `${url}/api/security/activate`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentId }),
-      },
-    );
+    const res = await fetchWithTimeout(`${url}/api/security/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId }),
+    });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       if (res.status === 403 && (body as any).state === 'revoked') {
         return { token: '', expiresAt: 0, state: 'revoked' };
       }
-      logger.warn({ status: res.status, agentId }, 'Nexus token request failed');
+      logger.warn(
+        { status: res.status, agentId },
+        'Nexus token request failed',
+      );
       return null;
     }
     return res.json() as Promise<TokenResponse>;
@@ -103,17 +101,14 @@ async function requestToken(): Promise<TokenResponse | null> {
 async function checkToken(token: string): Promise<CheckResponse> {
   const { url, agentId } = getNexusConfig();
   try {
-    const res = await fetchWithTimeout(
-      `${url}/api/security/verify`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Agent-Token': token,
-        },
-        body: JSON.stringify({ agentId }),
+    const res = await fetchWithTimeout(`${url}/api/security/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Agent-Token': token,
       },
-    );
+      body: JSON.stringify({ agentId }),
+    });
     if (!res.ok) {
       return { valid: false, state: 'suspended', reason: `http_${res.status}` };
     }
@@ -180,7 +175,11 @@ async function refreshToken(): Promise<void> {
   gateState = response.state;
 
   logger.info(
-    { agentId, state: gateState, expiresAt: new Date(tokenExpiresAt).toISOString() },
+    {
+      agentId,
+      state: gateState,
+      expiresAt: new Date(tokenExpiresAt).toISOString(),
+    },
     'Nexus activation token refreshed',
   );
 }
@@ -204,7 +203,10 @@ export async function initNexusGate(): Promise<void> {
       throw new Error(`Agent ${agentId} is REVOKED — cannot start`);
     }
     const delaySec = Math.min(30, attempt * 5);
-    logger.info({ agentId, attempt, delaySec }, 'Nexus gate: waiting to retry...');
+    logger.info(
+      { agentId, attempt, delaySec },
+      'Nexus gate: waiting to retry...',
+    );
     await new Promise((r) => setTimeout(r, delaySec * 1000));
   }
 

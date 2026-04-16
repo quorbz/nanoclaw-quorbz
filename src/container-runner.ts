@@ -230,7 +230,10 @@ async function buildContainerArgs(
     agent: vaultAgent ?? agentIdentifier,
   });
   if (onecliApplied) {
-    logger.info({ containerName, provider: llmConfig.provider }, 'OneCLI gateway config applied');
+    logger.info(
+      { containerName, provider: llmConfig.provider },
+      'OneCLI gateway config applied',
+    );
   } else {
     logger.warn(
       { containerName, provider: llmConfig.provider },
@@ -241,16 +244,28 @@ async function buildContainerArgs(
     if (llmConfig.provider === 'anthropic') {
       if (ANTHROPIC_API_KEY) {
         args.push('-e', `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`);
-        logger.info({ containerName }, 'ANTHROPIC_API_KEY injected directly from host env');
+        logger.info(
+          { containerName },
+          'ANTHROPIC_API_KEY injected directly from host env',
+        );
       } else {
-        logger.error({ containerName }, 'No ANTHROPIC_API_KEY available — agent will fail to authenticate');
+        logger.error(
+          { containerName },
+          'No ANTHROPIC_API_KEY available — agent will fail to authenticate',
+        );
       }
     } else {
       if (XAI_API_KEY) {
         args.push('-e', `XAI_API_KEY=${XAI_API_KEY}`);
-        logger.info({ containerName }, 'XAI_API_KEY injected directly from host env');
+        logger.info(
+          { containerName },
+          'XAI_API_KEY injected directly from host env',
+        );
       } else {
-        logger.error({ containerName }, 'No XAI_API_KEY available — agent will fail to authenticate');
+        logger.error(
+          { containerName },
+          'No XAI_API_KEY available — agent will fail to authenticate',
+        );
       }
     }
   }

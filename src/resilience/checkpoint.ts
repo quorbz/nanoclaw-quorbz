@@ -70,7 +70,10 @@ function saveCheckpointToDisk(cp: TaskCheckpoint): void {
       'utf-8',
     );
   } catch (err) {
-    logger.error({ err, taskId: cp.taskId }, 'Checkpoint: failed to write disk cache');
+    logger.error(
+      { err, taskId: cp.taskId },
+      'Checkpoint: failed to write disk cache',
+    );
   }
 }
 
@@ -242,12 +245,17 @@ export async function checkpointFailed(
 export function loadInterruptedCheckpoints(): TaskCheckpoint[] {
   try {
     fs.mkdirSync(CHECKPOINT_CACHE_DIR, { recursive: true });
-    const files = fs.readdirSync(CHECKPOINT_CACHE_DIR).filter((f) => f.endsWith('.json'));
+    const files = fs
+      .readdirSync(CHECKPOINT_CACHE_DIR)
+      .filter((f) => f.endsWith('.json'));
     const checkpoints: TaskCheckpoint[] = [];
 
     for (const file of files) {
       try {
-        const raw = fs.readFileSync(path.join(CHECKPOINT_CACHE_DIR, file), 'utf-8');
+        const raw = fs.readFileSync(
+          path.join(CHECKPOINT_CACHE_DIR, file),
+          'utf-8',
+        );
         const cp = JSON.parse(raw) as TaskCheckpoint;
         // Only recover tasks that were interrupted mid-flight
         if (cp.status === 'start' || cp.status === 'running') {

@@ -45,7 +45,10 @@ export function initEgress(): void {
   const { url } = getNexusConfig();
   try {
     nexusHostname = new URL(url).hostname;
-    logger.info({ nexusHostname }, 'Egress: Nexus hostname added to system allowlist');
+    logger.info(
+      { nexusHostname },
+      'Egress: Nexus hostname added to system allowlist',
+    );
   } catch {
     logger.warn({ url }, 'Egress: could not parse Nexus URL for allowlist');
   }
@@ -58,7 +61,9 @@ export function initEgress(): void {
 function getAllowlist(): string[] {
   const env = readEnvFile(['AGENT_EGRESS_ALLOWLIST']);
   const envDomains = (
-    process.env.AGENT_EGRESS_ALLOWLIST || env.AGENT_EGRESS_ALLOWLIST || ''
+    process.env.AGENT_EGRESS_ALLOWLIST ||
+    env.AGENT_EGRESS_ALLOWLIST ||
+    ''
   )
     .split(',')
     .map((d) => d.trim())

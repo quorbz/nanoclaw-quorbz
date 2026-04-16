@@ -26,8 +26,8 @@ export interface MachineFingerprint {
   hostname: string;
   platform: string;
   arch: string;
-  ipRangePrefix: string;   // first two octets, e.g. "192.168"
-  hardwareHash: string;    // stable hash of hostname + platform + arch
+  ipRangePrefix: string; // first two octets, e.g. "192.168"
+  hardwareHash: string; // stable hash of hostname + platform + arch
   registeredAt: string;
 }
 
@@ -112,16 +112,18 @@ function loadCachedFingerprint(): MachineFingerprint | null {
  */
 function saveCachedFingerprint(fp: MachineFingerprint): void {
   fs.mkdirSync(path.dirname(FINGERPRINT_CACHE_PATH), { recursive: true });
-  fs.writeFileSync(FINGERPRINT_CACHE_PATH, JSON.stringify(fp, null, 2), 'utf-8');
+  fs.writeFileSync(
+    FINGERPRINT_CACHE_PATH,
+    JSON.stringify(fp, null, 2),
+    'utf-8',
+  );
 }
 
 /**
  * Register this machine's fingerprint with Nexus.
  * Called on first deploy. Saves to local cache for future comparison.
  */
-async function registerFingerprint(
-  fp: MachineFingerprint,
-): Promise<boolean> {
+async function registerFingerprint(fp: MachineFingerprint): Promise<boolean> {
   const { url, agentId } = getNexusConfig();
   const token = getNexusToken();
   try {
@@ -134,7 +136,10 @@ async function registerFingerprint(
       body: JSON.stringify({ agentId, fingerprint: fp }),
     });
     if (!res.ok) {
-      logger.error({ status: res.status }, 'Failed to register fingerprint with Nexus');
+      logger.error(
+        { status: res.status },
+        'Failed to register fingerprint with Nexus',
+      );
       return false;
     }
     saveCachedFingerprint(fp);
@@ -171,7 +176,9 @@ async function verifyFingerprint(
     );
   }
   if (current.hardwareHash !== registered.hardwareHash) {
-    mismatches.push(`hardware_hash: ${current.hardwareHash} != ${registered.hardwareHash}`);
+    mismatches.push(
+      `hardware_hash: ${current.hardwareHash} != ${registered.hardwareHash}`,
+    );
   }
 
   if (mismatches.length === 0) {
@@ -229,7 +236,10 @@ export async function initFingerprintLock(): Promise<void> {
 
   if (!cached) {
     // First deploy — register
-    logger.info({ agentId }, 'No cached fingerprint — registering this machine');
+    logger.info(
+      { agentId },
+      'No cached fingerprint — registering this machine',
+    );
     const ok = await registerFingerprint(current);
     if (!ok) {
       // Nexus may be unreachable on very first deploy — log warning but allow

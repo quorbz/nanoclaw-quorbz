@@ -62,7 +62,9 @@ export const XAI_MODEL =
 
 // LLM provider abstraction — AI_PROVIDER=xai|anthropic
 export const AI_PROVIDER = (
-  process.env.AI_PROVIDER || envConfig.AI_PROVIDER || 'xai'
+  process.env.AI_PROVIDER ||
+  envConfig.AI_PROVIDER ||
+  'xai'
 ).toLowerCase();
 export const AI_MODEL = process.env.AI_MODEL || envConfig.AI_MODEL;
 export const AI_MODEL_PREMIUM =

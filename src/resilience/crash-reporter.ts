@@ -84,7 +84,10 @@ function writeCrashToDisk(report: Record<string, unknown>): string | null {
       .filter((f) => f.endsWith('.json'))
       .sort();
     if (existing.length >= MAX_CRASH_REPORTS) {
-      const toDelete = existing.slice(0, existing.length - MAX_CRASH_REPORTS + 1);
+      const toDelete = existing.slice(
+        0,
+        existing.length - MAX_CRASH_REPORTS + 1,
+      );
       for (const f of toDelete) {
         try {
           fs.unlinkSync(path.join(CRASH_REPORT_DIR, f));
@@ -100,12 +103,16 @@ function writeCrashToDisk(report: Record<string, unknown>): string | null {
     return filepath;
   } catch (writeErr) {
     // Can't use logger here — it may itself be broken
-    process.stderr.write(`[crash-reporter] Failed to write crash report: ${writeErr}\n`);
+    process.stderr.write(
+      `[crash-reporter] Failed to write crash report: ${writeErr}\n`,
+    );
     return null;
   }
 }
 
-async function pushCrashToNexus(report: Record<string, unknown>): Promise<void> {
+async function pushCrashToNexus(
+  report: Record<string, unknown>,
+): Promise<void> {
   const { url, agentId } = getNexusConfig();
   const token = getNexusToken();
 

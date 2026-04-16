@@ -20,21 +20,21 @@ export type LLMProvider = 'xai' | 'anthropic';
 export interface LLMConfig {
   provider: LLMProvider;
   model: string;
-  apiKeyEnvVar: string;  // which env var holds the key for this provider
+  apiKeyEnvVar: string; // which env var holds the key for this provider
 }
 
 const DEFAULT_MODELS: Record<LLMProvider, string> = {
-  xai:       'grok-4-1-fast-reasoning',
+  xai: 'grok-4-1-fast-reasoning',
   anthropic: 'claude-sonnet-4-6',
 };
 
 const PREMIUM_MODELS: Record<LLMProvider, string> = {
-  xai:       'grok-4-1',               // full reasoning, higher cost
-  anthropic: 'claude-opus-4-6',        // requires Benjamin approval per policy
+  xai: 'grok-4-1', // full reasoning, higher cost
+  anthropic: 'claude-opus-4-6', // requires Benjamin approval per policy
 };
 
 const API_KEY_ENV_VARS: Record<LLMProvider, string> = {
-  xai:       'XAI_API_KEY',
+  xai: 'XAI_API_KEY',
   anthropic: 'ANTHROPIC_API_KEY',
 };
 
@@ -51,7 +51,9 @@ export function resolveLLMConfig(): LLMConfig {
   ]);
 
   const rawProvider = (
-    process.env.AI_PROVIDER || envConfig.AI_PROVIDER || 'xai'
+    process.env.AI_PROVIDER ||
+    envConfig.AI_PROVIDER ||
+    'xai'
   ).toLowerCase();
 
   if (rawProvider !== 'xai' && rawProvider !== 'anthropic') {
@@ -79,9 +81,7 @@ export function resolveLLMConfig(): LLMConfig {
     );
   } else {
     model =
-      process.env.AI_MODEL ||
-      envConfig.AI_MODEL ||
-      DEFAULT_MODELS[provider];
+      process.env.AI_MODEL || envConfig.AI_MODEL || DEFAULT_MODELS[provider];
   }
 
   const config: LLMConfig = {

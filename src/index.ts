@@ -65,11 +65,18 @@ import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
-import { initNexusGate, isGateActive, shutdownNexusGate } from './security/nexus-gate.js';
+import {
+  initNexusGate,
+  isGateActive,
+  shutdownNexusGate,
+} from './security/nexus-gate.js';
 import { initFingerprintLock } from './security/fingerprint.js';
 import { loadRoleManifest } from './security/role-boundary.js';
 import { initEgress } from './security/egress.js';
-import { initCrashReporter, setCrashContext } from './resilience/crash-reporter.js';
+import {
+  initCrashReporter,
+  setCrashContext,
+} from './resilience/crash-reporter.js';
 import { loadInterruptedCheckpoints } from './resilience/checkpoint.js';
 
 // Re-export for backwards compatibility during refactor
@@ -460,7 +467,9 @@ async function startMessageLoop(): Promise<void> {
   while (true) {
     // ── Nexus gate check — halt processing if token revoked or suspended ──
     if (!isGateActive()) {
-      logger.warn('Nexus gate not active — skipping task processing this cycle');
+      logger.warn(
+        'Nexus gate not active — skipping task processing this cycle',
+      );
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
       continue;
     }

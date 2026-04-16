@@ -22,11 +22,11 @@ import { getNexusToken } from './nexus-gate.js';
 
 export interface RoleManifest {
   agentId: string;
-  allowedTools: string[];        // e.g. ['read_file', 'write_file', 'bash']
-  allowedDomains: string[];      // e.g. ['api.x.ai', 'openai.etsy.com']
+  allowedTools: string[]; // e.g. ['read_file', 'write_file', 'bash']
+  allowedDomains: string[]; // e.g. ['api.x.ai', 'openai.etsy.com']
   allowedAgentContacts: string[]; // agent IDs this agent can message
   maxConcurrentTasks: number;
-  allowPremiumModel: boolean;    // whether AI_ENABLE_PREMIUM is permitted
+  allowPremiumModel: boolean; // whether AI_ENABLE_PREMIUM is permitted
 }
 
 // Default policy: minimal permissions, no external domains, no premium
@@ -56,18 +56,26 @@ function getNexusConfig(): { url: string; agentId: string } {
 export async function loadRoleManifest(): Promise<RoleManifest> {
   const { url, agentId } = getNexusConfig();
   const env = readEnvFile(['AGENT_ROLE_MANIFEST']);
-  const manifestPath = process.env.AGENT_ROLE_MANIFEST || env.AGENT_ROLE_MANIFEST;
+  const manifestPath =
+    process.env.AGENT_ROLE_MANIFEST || env.AGENT_ROLE_MANIFEST;
 
   // Try loading from local file first
   if (manifestPath) {
     try {
       const raw = fs.readFileSync(manifestPath, 'utf-8');
-      const manifest: RoleManifest = { ...DEFAULT_MANIFEST, ...JSON.parse(raw) as Partial<RoleManifest>, agentId };
+      const manifest: RoleManifest = {
+        ...DEFAULT_MANIFEST,
+        ...(JSON.parse(raw) as Partial<RoleManifest>),
+        agentId,
+      };
       loadedManifest = manifest;
       logger.info({ agentId, manifestPath }, 'Role manifest loaded from file');
       return manifest;
     } catch (err) {
-      logger.warn({ err, manifestPath }, 'Failed to load role manifest from file');
+      logger.warn(
+        { err, manifestPath },
+        'Failed to load role manifest from file',
+      );
     }
   }
 
@@ -78,7 +86,7 @@ export async function loadRoleManifest(): Promise<RoleManifest> {
       headers: token ? { 'X-Agent-Token': token } : {},
     });
     if (res.ok) {
-      const data = await res.json() as RoleManifest;
+      const data = (await res.json()) as RoleManifest;
       loadedManifest = { ...DEFAULT_MANIFEST, ...data };
       logger.info({ agentId }, 'Role manifest fetched from Nexus');
       return loadedManifest;
