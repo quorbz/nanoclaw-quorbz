@@ -62,9 +62,10 @@ export async function loadRoleManifest(): Promise<RoleManifest> {
   if (manifestPath) {
     try {
       const raw = fs.readFileSync(manifestPath, 'utf-8');
-      loadedManifest = { ...DEFAULT_MANIFEST, ...JSON.parse(raw), agentId };
+      const manifest: RoleManifest = { ...DEFAULT_MANIFEST, ...JSON.parse(raw) as Partial<RoleManifest>, agentId };
+      loadedManifest = manifest;
       logger.info({ agentId, manifestPath }, 'Role manifest loaded from file');
-      return loadedManifest;
+      return manifest;
     } catch (err) {
       logger.warn({ err, manifestPath }, 'Failed to load role manifest from file');
     }
