@@ -2,7 +2,7 @@
   "name": "nanoclaw-quorbz-agent-runner",
   "version": "1.0.0",
   "type": "module",
-  "description": "Container-side agent runner for NanoClaw-Quorbz — xAI/Grok via OpenAI-compatible API",
+  "description": "Container-side agent runner for NanoClaw-Quorbz — multi-provider (xAI/Grok + Anthropic/Claude)",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "openai": "^4.98.0",
+    "@anthropic-ai/sdk": "^0.52.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "cron-parser": "^5.0.0",
     "zod": "^4.0.0",

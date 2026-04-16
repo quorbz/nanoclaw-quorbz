@@ -1,7 +1,11 @@
 /**
  * NanoClaw-Quorbz Agent Runner
  * Runs inside a container, receives config via stdin, outputs result to stdout.
- * Uses xAI (Grok) via the OpenAI-compatible API — no Anthropic dependencies.
+ * Multi-provider: xAI (Grok via OpenAI-compatible API) or Anthropic (Claude).
+ *
+ * Provider selection:  AI_PROVIDER=xai|anthropic  (default: xai)
+ * Model selection:     AI_MODEL=<model-id>         (default per provider)
+ * Premium model:       AI_ENABLE_PREMIUM=true       (logs cost event, requires approval)
  *
  * Input protocol:
  *   Stdin: Full ContainerInput JSON (read until EOF)
@@ -13,7 +17,7 @@
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
  *   Multiple results may be emitted. Final marker after loop ends signals completion.
  *
- * Credentials: XAI_API_KEY injected by OneCLI at runtime — never hardcoded.
+ * Credentials: injected by OneCLI at runtime — XAI_API_KEY or ANTHROPIC_API_KEY.
  */
 
 import fs from 'fs';
@@ -22,17 +26,40 @@ import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 import { glob } from 'glob';
 import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Provider configuration
 // ---------------------------------------------------------------------------
 
+type LLMProvider = 'xai' | 'anthropic';
+
+const PROVIDER = (process.env.AI_PROVIDER ?? 'xai').toLowerCase() === 'anthropic'
+  ? 'anthropic'
+  : 'xai' as LLMProvider;
+
+const DEFAULT_MODELS: Record<LLMProvider, string> = {
+  xai:       'grok-4-1-fast-reasoning',
+  anthropic: 'claude-sonnet-4-6',
+};
+
+const PREMIUM_MODELS: Record<LLMProvider, string> = {
+  xai:       'grok-4-1',
+  anthropic: 'claude-opus-4-6',
+};
+
+const PREMIUM_ENABLED = process.env.AI_ENABLE_PREMIUM === 'true';
+
+const MODEL: string = PREMIUM_ENABLED
+  ? (process.env.AI_MODEL ?? PREMIUM_MODELS[PROVIDER])
+  : (process.env.AI_MODEL ?? process.env.XAI_MODEL ?? DEFAULT_MODELS[PROVIDER]);
+
+const MAX_TOKENS = parseInt(process.env.AI_MAX_TOKENS ?? process.env.XAI_MAX_TOKENS ?? '8192', 10);
+
 const XAI_BASE_URL = 'https://api.x.ai/v1';
-const DEFAULT_MODEL = 'grok-4-1-fast-reasoning';
-const MODEL = process.env.XAI_MODEL ?? DEFAULT_MODEL;
-const MAX_TOKENS = parseInt(process.env.XAI_MAX_TOKENS ?? '8192', 10);
+
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
@@ -67,7 +94,13 @@ interface ScriptResult {
   data?: unknown;
 }
 
+// We use OpenAI message format internally throughout
 type Message = OpenAI.Chat.ChatCompletionMessageParam;
+
+interface NormalizedResponse {
+  content: string | null;
+  toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
+}
 
 // ---------------------------------------------------------------------------
 // Logging and output helpers
@@ -117,7 +150,7 @@ function drainIpcInput(): string[] {
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) messages.push(data.text);
+        if (data.type === 'message' && data.text) messages.push(data.text as string);
       } catch { try { fs.unlinkSync(filePath); } catch { /* ignore */ } }
     }
     return messages;
@@ -234,7 +267,7 @@ async function toolWebFetch(url: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in tool definitions (OpenAI function-calling format)
+// Built-in tool definitions (OpenAI function-calling format — used internally)
 // ---------------------------------------------------------------------------
 
 const BUILTIN_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
@@ -355,6 +388,169 @@ const BUILTIN_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// LLM Dispatcher — normalizes xAI and Anthropic behind a single interface
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert OpenAI-format tool definitions to Anthropic format.
+ */
+function toAnthropicTools(tools: OpenAI.Chat.ChatCompletionTool[]): Anthropic.Tool[] {
+  return tools.map((t) => ({
+    name: t.function.name,
+    description: t.function.description ?? '',
+    input_schema: (t.function.parameters ?? { type: 'object', properties: {} }) as Anthropic.Tool['input_schema'],
+  }));
+}
+
+/**
+ * Convert OpenAI-format message history to Anthropic format.
+ * Returns { system, messages } where system is extracted from the first system message.
+ *
+ * Anthropic rules:
+ *  - Messages must alternate user/assistant
+ *  - tool_calls on assistant → tool_use content blocks
+ *  - tool results → tool_result blocks merged into a single user message
+ */
+function toAnthropicMessages(messages: Message[]): {
+  system: string;
+  messages: Anthropic.MessageParam[];
+} {
+  let system = '';
+  const result: Anthropic.MessageParam[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      system = typeof msg.content === 'string' ? msg.content : '';
+      continue;
+    }
+
+    if (msg.role === 'user') {
+      const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+      // If last message is also user (e.g., after merging tool results), merge
+      const last = result[result.length - 1];
+      if (last?.role === 'user') {
+        const prev = last.content;
+        if (typeof prev === 'string') {
+          last.content = [{ type: 'text', text: prev }, { type: 'text', text: content }];
+        } else if (Array.isArray(prev)) {
+          (prev as Anthropic.ContentBlockParam[]).push({ type: 'text', text: content });
+        }
+      } else {
+        result.push({ role: 'user', content });
+      }
+      continue;
+    }
+
+    if (msg.role === 'assistant') {
+      const oaiMsg = msg as OpenAI.Chat.ChatCompletionAssistantMessageParam;
+      if (oaiMsg.tool_calls && oaiMsg.tool_calls.length > 0) {
+        const blocks: Anthropic.ContentBlockParam[] = [];
+        if (oaiMsg.content) {
+          blocks.push({ type: 'text', text: typeof oaiMsg.content === 'string' ? oaiMsg.content : '' });
+        }
+        for (const tc of oaiMsg.tool_calls) {
+          let input: Record<string, unknown> = {};
+          try { input = JSON.parse(tc.function.arguments) as Record<string, unknown>; } catch { /* empty */ }
+          blocks.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+        }
+        result.push({ role: 'assistant', content: blocks });
+      } else {
+        const text = typeof oaiMsg.content === 'string' ? oaiMsg.content : '';
+        result.push({ role: 'assistant', content: [{ type: 'text', text }] });
+      }
+      continue;
+    }
+
+    if (msg.role === 'tool') {
+      const toolMsg = msg as OpenAI.Chat.ChatCompletionToolMessageParam;
+      const toolResult: Anthropic.ToolResultBlockParam = {
+        type: 'tool_result',
+        tool_use_id: toolMsg.tool_call_id,
+        content: typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content),
+      };
+      // Merge consecutive tool results into one user message
+      const last = result[result.length - 1];
+      if (last?.role === 'user' && Array.isArray(last.content) &&
+          (last.content as Anthropic.ContentBlockParam[]).some((b) => b.type === 'tool_result')) {
+        (last.content as Anthropic.ContentBlockParam[]).push(toolResult);
+      } else {
+        result.push({ role: 'user', content: [toolResult] });
+      }
+    }
+  }
+
+  return { system, messages: result };
+}
+
+/**
+ * Call xAI (OpenAI-compatible) and return a normalized response.
+ */
+async function callXai(
+  client: OpenAI,
+  messages: Message[],
+  tools: OpenAI.Chat.ChatCompletionTool[],
+): Promise<NormalizedResponse> {
+  const response = await client.chat.completions.create({
+    model: MODEL,
+    messages,
+    tools: tools.length > 0 ? tools : undefined,
+    tool_choice: tools.length > 0 ? 'auto' : undefined,
+    max_tokens: MAX_TOKENS,
+  });
+
+  const choice = response.choices[0];
+  if (!choice) throw new Error('No response from xAI');
+
+  const msg = choice.message;
+  return {
+    content: msg.content ?? null,
+    toolCalls: (msg.tool_calls ?? []).map((tc) => {
+      let args: Record<string, unknown> = {};
+      try { args = JSON.parse(tc.function.arguments) as Record<string, unknown>; } catch { /* empty */ }
+      return { id: tc.id, name: tc.function.name, arguments: args };
+    }),
+  };
+}
+
+/**
+ * Call Anthropic and return a normalized response.
+ */
+async function callAnthropic(
+  client: Anthropic,
+  messages: Message[],
+  tools: OpenAI.Chat.ChatCompletionTool[],
+): Promise<NormalizedResponse> {
+  const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
+  const anthropicTools = tools.length > 0 ? toAnthropicTools(tools) : undefined;
+
+  const response = await client.messages.create({
+    model: MODEL,
+    system: system || undefined,
+    messages: anthropicMessages,
+    tools: anthropicTools,
+    tool_choice: anthropicTools ? { type: 'auto' } : undefined,
+    max_tokens: MAX_TOKENS,
+  });
+
+  let text: string | null = null;
+  const toolCalls: NormalizedResponse['toolCalls'] = [];
+
+  for (const block of response.content) {
+    if (block.type === 'text') {
+      text = (text ?? '') + block.text;
+    } else if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: block.id,
+        name: block.name,
+        arguments: block.input as Record<string, unknown>,
+      });
+    }
+  }
+
+  return { content: text, toolCalls };
+}
+
+// ---------------------------------------------------------------------------
 // MCP client — NanoClaw IPC tools (send_message, schedule_task, etc.)
 // ---------------------------------------------------------------------------
 
@@ -436,13 +632,14 @@ async function dispatchTool(
 }
 
 // ---------------------------------------------------------------------------
-// Agent loop — calls xAI, executes tools, iterates until done
+// Agent loop — provider-agnostic, uses OpenAI message format internally
 // ---------------------------------------------------------------------------
 
 async function runAgentLoop(
   prompt: string,
   systemPrompt: string,
-  xaiClient: OpenAI,
+  xaiClient: OpenAI | null,
+  anthropicClient: Anthropic | null,
   tools: OpenAI.Chat.ChatCompletionTool[],
   mcpClient: Client | null,
 ): Promise<string> {
@@ -454,54 +651,54 @@ async function runAgentLoop(
   const MAX_ITER = 50;
 
   for (let iter = 0; iter < MAX_ITER; iter++) {
-    log(`Agent loop iteration ${iter + 1}`);
+    log(`Agent loop iteration ${iter + 1} [${PROVIDER}/${MODEL}]`);
 
-    let response: OpenAI.Chat.ChatCompletion;
+    let normalized: NormalizedResponse;
     try {
-      response = await xaiClient.chat.completions.create({
-        model: MODEL,
-        messages,
-        tools: tools.length > 0 ? tools : undefined,
-        tool_choice: tools.length > 0 ? 'auto' : undefined,
-        max_tokens: MAX_TOKENS,
-      });
+      if (PROVIDER === 'anthropic' && anthropicClient) {
+        normalized = await callAnthropic(anthropicClient, messages, tools);
+      } else if (xaiClient) {
+        normalized = await callXai(xaiClient, messages, tools);
+      } else {
+        throw new Error('No LLM client available');
+      }
     } catch (err) {
-      const msg = `xAI API error: ${(err as Error).message}`;
+      const msg = `LLM API error (${PROVIDER}): ${(err as Error).message}`;
       log(msg);
       return msg;
     }
 
-    const choice = response.choices[0];
-    if (!choice) return 'No response from model';
-
-    const assistantMsg = choice.message;
-    messages.push(assistantMsg as Message);
+    // Append assistant message in OpenAI format
+    if (normalized.toolCalls.length > 0) {
+      messages.push({
+        role: 'assistant',
+        content: normalized.content ?? null,
+        tool_calls: normalized.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function' as const,
+          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+        })),
+      });
+    } else {
+      messages.push({ role: 'assistant', content: normalized.content ?? '' });
+    }
 
     // No tool calls — final answer
-    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
-      return assistantMsg.content ?? '';
+    if (normalized.toolCalls.length === 0) {
+      return normalized.content ?? '';
     }
 
     // Execute tool calls sequentially
-    for (const toolCall of assistantMsg.tool_calls) {
-      const toolName = toolCall.function.name;
-      let toolArgs: Record<string, unknown> = {};
-      try { toolArgs = JSON.parse(toolCall.function.arguments) as Record<string, unknown>; } catch { /* empty */ }
-
-      log(`Tool: ${toolName}`);
-      const result = await dispatchTool(toolName, toolArgs, mcpClient);
-      log(`Tool ${toolName}: ${result.length} chars`);
-
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: result,
-      } as Message);
+    for (const tc of normalized.toolCalls) {
+      log(`Tool: ${tc.name}`);
+      const result = await dispatchTool(tc.name, tc.arguments, mcpClient);
+      log(`Tool ${tc.name}: ${result.length} chars`);
+      messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
     }
 
     if (shouldClose()) {
       log('Close sentinel during agent loop');
-      return assistantMsg.content ?? '(interrupted)';
+      return normalized.content ?? '(interrupted)';
     }
   }
 
@@ -530,7 +727,7 @@ async function runScript(script: string): Promise<ScriptResult | null> {
         const result = JSON.parse(lastLine);
         if (typeof result.wakeAgent !== 'boolean') { log('Script: missing wakeAgent'); return resolve(null); }
         resolve(result as ScriptResult);
-      } catch { log(`Script: invalid JSON output`); resolve(null); }
+      } catch { log('Script: invalid JSON output'); resolve(null); }
     });
   });
 }
@@ -559,7 +756,7 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
     }
   }
 
-  lines.push(`Model: ${MODEL}`);
+  lines.push(`Provider: ${PROVIDER} | Model: ${MODEL}`);
   lines.push(`Working directory: /workspace/group`);
   lines.push(`Group folder: ${containerInput.groupFolder}`);
   if (containerInput.assistantName) lines.push(`Name: ${containerInput.assistantName}`);
@@ -602,21 +799,35 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Validate API key
-  const apiKey = process.env.XAI_API_KEY;
-  if (!apiKey) {
-    writeOutput({ status: 'error', result: null, error: 'XAI_API_KEY not set — check OneCLI vault configuration' });
-    process.exit(1);
+  // Log premium model usage as cost event
+  if (PREMIUM_ENABLED) {
+    log(`PREMIUM MODEL ACTIVE: ${MODEL} — cost event logged. Requires Benjamin approval per policy.`);
+  }
+
+  log(`Provider: ${PROVIDER} | Model: ${MODEL}`);
+
+  // Validate API key for the selected provider
+  let xaiClient: OpenAI | null = null;
+  let anthropicClient: Anthropic | null = null;
+
+  if (PROVIDER === 'anthropic') {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      writeOutput({ status: 'error', result: null, error: 'ANTHROPIC_API_KEY not set — check OneCLI vault configuration' });
+      process.exit(1);
+    }
+    anthropicClient = new Anthropic({ apiKey });
+  } else {
+    const apiKey = process.env.XAI_API_KEY;
+    if (!apiKey) {
+      writeOutput({ status: 'error', result: null, error: 'XAI_API_KEY not set — check OneCLI vault configuration' });
+      process.exit(1);
+    }
+    xaiClient = new OpenAI({ apiKey, baseURL: XAI_BASE_URL });
   }
 
   // Startup health check
   const healthWarnings = runHealthCheck(containerInput.groupFolder);
-  if (healthWarnings.length > 0) {
-    log(`HEALTH WARNING: ${healthWarnings.join('; ')}`);
-    // Continue running — health warnings are non-fatal, but will be reported via agent response
-  }
-
-  const xaiClient = new OpenAI({ apiKey, baseURL: XAI_BASE_URL });
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
@@ -649,20 +860,20 @@ async function main(): Promise<void> {
     prompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${containerInput.prompt}`;
   }
 
-  // Health warning injection — if files are missing, tell the agent to report it
+  // Health warning injection
   if (healthWarnings.length > 0) {
     prompt = `[SYSTEM HEALTH WARNING — report to Benjamin via Telegram before doing anything else]\nMissing memory files: ${healthWarnings.join(', ')}\n\n${prompt}`;
   }
 
   const systemPrompt = buildSystemPrompt(containerInput);
-  const sessionId = `xai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const sessionId = `${PROVIDER}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // Main query-and-wait loop
   let currentPrompt = prompt;
   try {
     while (true) {
       log(`Running agent loop (session: ${sessionId})...`);
-      const result = await runAgentLoop(currentPrompt, systemPrompt, xaiClient, allTools, mcpClient);
+      const result = await runAgentLoop(currentPrompt, systemPrompt, xaiClient, anthropicClient, allTools, mcpClient);
       log(`Loop complete: ${result.length} chars`);
 
       writeOutput({ status: 'success', result, newSessionId: sessionId });
